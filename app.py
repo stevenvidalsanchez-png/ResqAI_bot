@@ -1,158 +1,157 @@
 import os
 import logging
-import asyncio
+import requests
 from flask import Flask, request
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# Configuración de Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Configuración de Logging para ver eventos en Render
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Estados del flujo conversacional
-ROL, INCIDENTE, TRIAGE_PRO, CONCIENCIA_CIVIL, SANGRADO_CIVIL, UBICACION = range(6)
-
 app = Flask(__name__)
+
+# Recuperar el Token de las variables de entorno de Render
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-# Inicialización segura de la aplicación de Telegram
-telegram_app = None
-if TOKEN:
-    telegram_app = Application.builder().token(TOKEN).build()
-    
-    # Configuración de la lógica interna del bot
-    RED_HOSPITALARIA = {
-        "CRITICO_TRAUMA": {"nombre": "Hospital Universitario del Valle (HUV)", "nivel": 3, "zona": "Centro/Sur", "especialidad": "Trauma Mayor / Alta Complejidad"},
-        "ALTA_COMPLEJIDAD_SUR": {"nombre": "Fundación Valle del Lili", "nivel": 3, "zona": "Sur", "especialidad": "Cuidado Crítico / Trauma / Politrauma"},
-        "ALTA_COMPLEJIDAD_CENTRO": {"nombre": "Clínica Imbanaco", "nivel": 3, "zona": "Sur/Centro", "especialidad": "Trauma / Cirugía de Urgencias"}
+# Diccionario temporal para simular el estado de la conversación por usuario
+# Nota: En producción avanzada usarías una base de datos, para el proyecto final esto es perfecto.
+ESTADOS_USUARIO = {}
+
+RED_HOSPITALARIA = {
+    "CRITICO_TRAUMA": {"nombre": "Hospital Universitario del Valle (HUV)", "zona": "Centro/Sur", "especialidad": "Trauma Mayor"},
+    "ALTA_COMPLEJIDAD_SUR": {"nombre": "Fundación Valle del Lili", "zona": "Sur", "especialidad": "Cuidado Crítico"},
+    "ALTA_COMPLEJIDAD_CENTRO": {"nombre": "Clínica Imbanaco", "zona": "Centro", "especialidad": "Trauma / Urgencias"}
+}
+
+def enviar_mensaje_telegram(chat_id, texto, botones=None):
+    """Función nativa usando solicitudes HTTP POST para enviar mensajes y teclados."""
+    payload = {
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "Markdown"
     }
-
-    def procesar_despacho_resqai(datos):
-        rol = datos.get('rol', '')
-        incidente = datos.get('incidente', '').lower()
-        if rol == "Ciudadano":
-            conciencia = datos.get('conciencia_civil', '')
-            sangrado = datos.get('sangrado_civil', '')
-            es_critico = (conciencia == "No responde / Está inconsciente") or (sangrado == "Sí, es abundante y no para")
-        else:
-            via_aerea = datos.get('triage_pro', '')
-            es_critico = "Comprometida" in via_aerea
-
-        despacho = {
-            "Ambulancia": "🚨 Soporte Vital Avanzado (Medicalizada)" if es_critico else "🚑 Soporte Vital Básico",
-            "Bomberos": "🚒 ACTIVADO (Rescate Vehicular)" if "tránsito" in incidente or "atrapado" in incidente else "NO requerido",
-            "Policia": "🚓 ACTIVADO (Seguridad de Escena)",
-            "Movilidad/Transito": "🛵 ACTIVADO (Regulación de tráfico)" if "tránsito" in incidente else "NO requerido"
+    if botones:
+        payload["reply_markup"] = {
+            "keyboard": botones,
+            "one_time_keyboard": True,
+            "resize_keyboard": True
         }
-        hospital_destino = RED_HOSPITALARIA["CRITICO_TRAUMA"] if es_critico else RED_HOSPITALARIA["ALTA_COMPLEJIDAD_SUR"]
-        return despacho, hospital_destino, es_critico
+    else:
+        payload["reply_markup"] = {"remove_keyboard": True}
+        
+    try:
+        requests.post(TELEGRAM_API_URL, json=payload)
+    except Exception as e:
+        logger.error(f"Error enviando mensaje: {e}")
 
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        reply_keyboard = [['Ciudadano (Presencio una emergencia)'], ['Personal de Emergencias (APH / Bomberos)']]
-        await update.message.reply_text(
-            "🚨 **ResqAI - Sistema de Optimización de Rescate con IA** 🚨\n\n"
-            "Bienvenido al asistente de despacho de emergencias.\n"
-            "Para guiarlo de forma correcta, por favor indique quién reporta:",
-            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
-            parse_mode="Markdown"
-        )
-        return ROL
-
-    async def rol_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['rol'] = "Ciudadano" if "Ciudadano" in update.message.text else "Profesional"
-        reply_keyboard = [['Accidente de Tránsito', 'Persona Inconsciente/Enferma'], ['Caída/Trauma Grave', 'Herido (Arma/Pelea)']]
-        await update.message.reply_text("📝 **¿Qué tipo de emergencia está ocurriendo?**", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
-        return INCIDENTE
-
-    async def incidente_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['incidente'] = update.message.text
-        if context.user_data['rol'] == "Profesional":
-            reply_keyboard = [['Despejada / Normal'], ['Obstruida / Comprometida (Triage Rojo)']]
-            await update.message.reply_text("🫁 **Evaluación Profesional de Vía Aérea:**", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
-            return TRIAGE_PRO
-        else:
-            reply_keyboard = [['Sí, habla o se mueve'], ['No responde / Está inconsciente'], ['No estoy seguro']]
-            await update.message.reply_text("🗣️ **¿La persona herida o enferma te responde, habla o se mueve al llamarla?**", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
-            return CONCIENCIA_CIVIL
-
-    async def triage_pro_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['triage_pro'] = update.message.text
-        return await solicitar_ubicacion(update)
-
-    async def conciencia_civil_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['conciencia_civil'] = update.message.text
-        reply_keyboard = [['Sí, es abundante y no para'], ['No tiene sangre / Es muy poca']]
-        await update.message.reply_text("🩸 **¿La persona tiene alguna herida donde se vea brotar mucha sangre?**", reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
-        return SANGRADO_CIVIL
-
-    async def sangrado_civil_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        context.user_data['sangrado_civil'] = update.message.text
-        return await solicitar_ubicacion(update)
-
-    async def solicitar_ubicacion(update: Update) -> int:
-        await update.message.reply_text("📍 **Por favor, envíe la Ubicación actual desde el icono de clip 📎 > Ubicación:**", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
-        return UBICACION
-
-    async def ubicacion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        user_location = update.message.location
-        lat, lon = user_location.latitude, user_location.longitude
-        despacho, hospital, es_critico = procesar_despacho_resqai(context.user_data)
-        url_ruta_escena = f"https://www.google.com/maps?q={lat},{lon}"
-        url_ruta_clinica = f"https://www.google.com/maps?q={hospital['nombre']}".replace(" ", "+")
-
-        reporte_operador = (
-            "🚒 **DESPACHO MULTI-AGENCIA ACTIVADO** 🚒\n"
-            f"👤 *Reportado por:* {context.user_data['rol']}\n"
-            f"🚨 *Suceso:* {context.user_data['incidente']}\n\n"
-            "📋 **Asignación de Recursos en Campo:**\n"
-            f"• **Ambulancia:** {despacho['Ambulancia']}\n"
-            f"• **Bomberos:** {despacho['Bomberos']}\n"
-            f"• **Policía:** {despacho['Policia']}\n"
-            f"• **Tránsito:** {despacho['Movilidad/Transito']}\n\n"
-            f"🗺️ [Navegar hacia la Escena]({url_ruta_escena})\n"
-        )
-        reporte_hospital = (
-            "🏥 **PRE-ALERTA HOSPITALARIA** 🏥\n"
-            f"🔔 **Centro:** {hospital['nombre']}\n"
-            f"📊 **Estado:** {'🔴 CRÍTICO' if es_critico else '🟡 ESTABLE'}\n\n"
-            f"🗺️ [Ver Ubicación de la Clínica]({url_ruta_clinica})\n"
-        )
-        await update.message.reply_text(reporte_operador, parse_mode="Markdown", disable_web_page_preview=True)
-        await update.message.reply_text(reporte_hospital, parse_mode="Markdown", disable_web_page_preview=True)
-        return ConversationHandler.END
-
-    async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        await update.message.reply_text("❌ Evaluación cancelada.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            ROL: [MessageHandler(filters.TEXT & ~filters.COMMAND, rol_callback)],
-            INCIDENTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, incidente_callback)],
-            TRIAGE_PRO: [MessageHandler(filters.TEXT & ~filters.COMMAND, triage_pro_callback)],
-            CONCIENCIA_CIVIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, conciencia_civil_callback)],
-            SANGRADO_CIVIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, sangrado_civil_callback)],
-            UBICACION: [MessageHandler(filters.LOCATION, ubicacion_callback)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    telegram_app.add_handler(conv_handler)
-
-# --- ENDPOINTS DEL SERVIDOR ---
+# --- ENLACE DEL SERVIDOR ---
 @app.route('/')
 def index():
-    return "🚀 ResqAI Core V2 Activo."
+    return "🚀 ResqAI Core V2 está en línea y optimizando despacho."
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    if telegram_app:
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.process_update(update))
-        loop.close()
-    return 'OK', 200
+    """Recibe los datos directamente desde los servidores de Telegram."""
+    data = request.get_json(force=True)
+    
+    if "message" not in data:
+        return "OK", 200
+        
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
+    
+    # Manejo del comando inicial
+    if text == "/start":
+        ESTADOS_USUARIO[chat_id] = {"paso": "ROL"}
+        botones = [["Ciudadano (Presencio una emergencia)"], ["Personal de Emergencias (APH)"]]
+        enviar_mensaje_telegram(
+            chat_id, 
+            "🚨 **ResqAI - Sistema de Optimización de Rescate con IA** 🚨\n\nBienvenido al asistente de despacho. Por favor, indique quién reporta:", 
+            botones
+        )
+        return "OK", 200
 
-# Removido el bloque local para evitar conflictos de hilos con Gunicorn en Render
+    # Si el usuario no ha iniciado el protocolo
+    if chat_id not in ESTADOS_USUARIO:
+        enviar_mensaje_telegram(chat_id, "Escribe /start para iniciar el sistema de triage ResqAI.")
+        return "OK", 200
 
+    estado = ESTADOS_USUARIO[chat_id]
+
+    # FLUJO - PASO: ROL
+    if estado["paso"] == "ROL":
+        estado["rol"] = "Ciudadano" if "Ciudadano" in text else "Profesional"
+        estado["paso"] = "INCIDENTE"
+        botones = [["Accidente de Tránsito"], ["Persona Inconsciente/Enferma"], ["Herido (Arma/Pelea)"]]
+        enviar_mensaje_telegram(chat_id, "📝 **¿Qué tipo de emergencia está ocurriendo?**", botones)
+
+    # FLUJO - PASO: INCIDENTE
+    elif estado["paso"] == "INCIDENTE":
+        estado["incidente"] = text
+        if estado["rol"] == "Profesional":
+            estado["paso"] = "TRIAGE_PRO"
+            botones = [["Despejada / Normal"], ["Obstruida / Comprometida"]]
+            enviar_mensaje_telegram(chat_id, "🫁 **Evaluación de Vía Aérea:**", botones)
+        else:
+            estado["paso"] = "CONCIENCIA_CIVIL"
+            botones = [["Sí, habla o se mueve"], ["No responde / Está inconsciente"]]
+            enviar_mensaje_telegram(chat_id, "🗣️ **¿La persona herida te responde, habla o se mueve al llamarla?**", botones)
+
+    # FLUJO - PASO: TRIAGE PROFESIONAL
+    elif estado["paso"] == "TRIAGE_PRO":
+        estado["es_critico"] = "Comprometida" in text
+        estado["paso"] = "FINAL"
+        solicitar_finalizacion(chat_id, estado)
+
+    # FLUJO - PASO: CONCIENCIA CIUDADANO
+    elif estado["paso"] == "CONCIENCIA_CIVIL":
+        estado["conciencia"] = text
+        estado["paso"] = "SANGRADO_CIVIL"
+        botones = [["Sí, es abundante"], ["No tiene sangre / Es muy poca"]]
+        enviar_mensaje_telegram(chat_id, "🩸 **¿La persona tiene alguna herida donde brote mucha sangre?**", botones)
+
+    # FLUJO - PASO: SANGRADO CIUDADANO
+    elif estado["paso"] == "SANGRADO_CIVIL":
+        estado["es_critico"] = ("No responde" in estado["conciencia"]) or ("abundante" in text)
+        estado["paso"] = "FINAL"
+        solicitar_finalizacion(chat_id, estado)
+
+    return "OK", 200
+
+def solicitar_finalizacion(chat_id, estado):
+    """Procesa el reporte final y despacha las agencias virtuales."""
+    incidente = estado.get("incidente", "Emergencia")
+    es_critico = estado.get("es_critico", False)
+    
+    # Lógica de asignación de recursos
+    ambulancia = "🚨 Soporte Vital Avanzado" if es_critico else "🚑 Soporte Vital Básico"
+    bomberos = "🚒 ACTIVADO (Rescate Vehicular)" if "Tránsito" in incidente else "NO requerido"
+    
+    # Asignación de Hospital
+    if es_critico:
+        hospital = RED_HOSPITALARIA["CRITICO_TRAUMA"] if "Tránsito" not in incidente else RED_HOSPITALARIA["ALTA_COMPLEJIDAD_CENTRO"]
+    else:
+        hospital = RED_HOSPITALARIA["ALTA_COMPLEJIDAD_SUR"]
+
+    reporte = (
+        "🚒 **DESPACHO MULTI-AGENCIA ACTIVADO** 🚒\n\n"
+        f"👤 *Reportado por:* {estado['rol']}\n"
+        f"🚨 *Suceso:* {incidente}\n\n"
+        "📋 **Asignación de Recursos:**\n"
+        f"• **Ambulancia:** {ambulancia}\n"
+        f"• **Bomberos:** {bomberos}\n"
+        f"• **Policía:** 🚓 ACTIVADO\n\n"
+        " Hospital Receptor Pre-alertado:\n"
+        f"• **Centro:** {hospital['nombre']}\n"
+        f"• **Complejidad:** {hospital['especialidad']} ({hospital['zona']})\n\n"
+        "🧠 _ResqAI: Triage dinámico procesado correctamente._"
+    )
+    
+    enviar_mensaje_telegram(chat_id, reporte)
+    # Limpiar estado del usuario al terminar
+    ESTADOS_USUARIO.pop(chat_id, None)
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
