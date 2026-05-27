@@ -4,31 +4,34 @@ from flask import Flask
 import telebot
 
 # ------------------------------------------------------------------
-# CONFIGURACIÓN DE FLASK (El truco para engañar a Render)
+# CONFIGURACIÓN DE FLASK
 # ------------------------------------------------------------------
 server = Flask(__name__)
 
 @server.route("/")
 def webhook_falso():
-    return "ResqAI está vivo y operando con normalidad.", 200
+    return "ResqAI está vivo y operando con normalidad de forma concurrente.", 200
 
 # ------------------------------------------------------------------
-# CONFIGURACIÓN DEL BOT DE TELEGRAM (Flujo Directo por Pasos)
+# CONFIGURACIÓN DEL BOT DE TELEGRAM CON CANDADO DE SEGURIDAD
 # ------------------------------------------------------------------
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
-# Diccionario temporal para guardar los datos de la sesión actual
+# Diccionario global y CANDADO para proteger la memoria concurrente
 datos_usuario = {}
+lock_memoria = threading.Lock()
 
 # 1. INICIO CON "HOLA"
 @bot.message_handler(func=lambda message: message.text.lower() in ['hola', 'buen día', 'buenos días', 'buenas tardes'])
 def saludo_inicial(message):
     chat_id = message.chat.id
-    datos_usuario[chat_id] = {} # Inicializar el contenedor de datos para este chat
+    
+    # Bloqueamos un milisegundo la memoria para registrar al nuevo usuario de forma segura
+    with lock_memoria:
+        datos_usuario[chat_id] = {}
     
     bot.send_message(chat_id, "¡Hola! Bienvenido al sistema de asistencia de emergencias ResqAI.\n\nPor favor, dime tu **nombre completo** para iniciar el registro.")
-    # Forzar a que el siguiente mensaje que envíe el usuario vaya directo a la función 'guardar_nombre'
     bot.register_next_step_handler(message, guardar_nombre)
 
 # 2. CAPTURA DEL NOMBRE Y PREGUNTA DE PERFIL
@@ -36,12 +39,13 @@ def guardar_nombre(message):
     chat_id = message.chat.id
     nombre_usuario = message.text
     
-    # Si el usuario escribe "Hola" de nuevo por error, reiniciar
     if nombre_usuario.lower() in ['hola', 'buen día', 'buenos días', 'buenas tardes']:
         saludo_inicial(message)
         return
 
-    datos_usuario[chat_id]['nombre'] = nombre_usuario
+    with lock_memoria:
+        if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
+        datos_usuario[chat_id]['nombre'] = nombre_usuario
     
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add('Persona del Común', 'Personal de Salud / Rescate')
@@ -58,8 +62,9 @@ def guardar_perfil(message):
     chat_id = message.chat.id
     perfil = message.text
     
-    if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
-    datos_usuario[chat_id]['perfil'] = perfil
+    with lock_memoria:
+        if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
+        datos_usuario[chat_id]['perfil'] = perfil
     
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add('Urgencia Médica (Salud)', 'Incidente / Bomberos', 'Seguridad (Policía)')
@@ -72,7 +77,9 @@ def clasificar_emergencia(message):
     chat_id = message.chat.id
     tipo = message.text
     
-    datos_usuario[chat_id]['tipo_emergencia'] = tipo
+    with lock_memoria:
+        if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
+        datos_usuario[chat_id]['tipo_emergencia'] = tipo
 
     if tipo == 'Incidente / Bomberos':
         markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -85,12 +92,15 @@ def clasificar_emergencia(message):
         bot.send_message(chat_id, "Selecciona la situación específica:", reply_markup=markup)
         bot.register_next_step_handler(message, guardar_detalle_bomberos)
     else:
-        datos_usuario[chat_id]['detalle_bomberos'] = 'N/A'
+        with lock_memoria:
+            datos_usuario[chat_id]['detalle_bomberos'] = 'N/A'
         forzar_solicitud_direccion(message)
 
 def guardar_detalle_bomberos(message):
     chat_id = message.chat.id
-    datos_usuario[chat_id]['detalle_bomberos'] = message.text
+    with lock_memoria:
+        if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
+        datos_usuario[chat_id]['detalle_bomberos'] = message.text
     forzar_solicitud_direccion(message)
 
 # 5. CAPTURA DE DIRECCIÓN
@@ -104,19 +114,20 @@ def forzar_solicitud_direccion(message):
     )
     bot.register_next_step_handler(message, finalizar_reporte)
 
-# 6, 7 y 8. LÓGICA DE DESPACHO, ASIGNACIÓN DE VEHÍCULOS Y CENTROS MÉDICOS
+# 6. LÓGICA DE DESPACHO Y CIERRE
 def finalizar_reporte(message):
     chat_id = message.chat.id
     direccion = message.text
     
-    if chat_id not in datos_usuario:
-        bot.send_message(chat_id, "Hubo un error de sesión. Por favor escribe 'Hola' de nuevo.")
-        return
-
-    nombre = datos_usuario[chat_id].get('nombre', 'Reportante Anónimo')
-    perfil = datos_usuario[chat_id].get('perfil', 'Persona del Común')
-    tipo = datos_usuario[chat_id].get('tipo_emergencia', 'No especificado')
-    detalle = datos_usuario[chat_id].get('detalle_bomberos', 'N/A')
+    # Lectura segura con Candado
+    with lock_memoria:
+        if chat_id not in datos_usuario:
+            bot.send_message(chat_id, "Hubo un error de sesión por alta demanda. Por favor escribe 'Hola' de nuevo.")
+            return
+        nombre = datos_usuario[chat_id].get('nombre', 'Reportante Anónimo')
+        perfil = datos_usuario[chat_id].get('perfil', 'Persona del Común')
+        tipo = datos_usuario[chat_id].get('tipo_emergencia', 'No especificado')
+        detalle = datos_usuario[chat_id].get('detalle_bomberos', 'N/A')
     
     instrucciones_triage = ""
     vehiculos_despachados = ""
@@ -125,7 +136,6 @@ def finalizar_reporte(message):
     if tipo == 'Urgencia Médica (Salud)':
         if perfil == 'Personal de Salud / Rescate':
             instrucciones_triage = "🚨 **Triage sugerido: Rojo (Prioridad I).** Inicie RCP si no hay pulso, controle sangrados masivos con torniquete."
-            vehiculos_despachados = "ambulancia_despacho_id" # Marcador conceptual de lógica
             vehiculos_despachados = "🚑 **Despachado:** Ambulancia Medicalizada (TAM) + Apoyo de Tránsito."
             hospital_destino = "🏥 **Remisión sugerida:** Hospital Universitario del Valle (HUV) o Clínica Imbanaco."
         else:
@@ -166,14 +176,16 @@ def finalizar_reporte(message):
     )
     
     bot.send_message(chat_id, respuesta_final, parse_mode="Markdown")
-    # Limpiar memoria de la sesión
-    datos_usuario.pop(chat_id, None)
+    
+    # Limpieza segura de memoria
+    with lock_memoria:
+        datos_usuario.pop(chat_id, None)
 
 # ------------------------------------------------------------------
 # CONTROL DE ARRANQUE SEGURO
 # ------------------------------------------------------------------
 def iniciar_bot_en_segundo_plano():
-    print("🚀 Iniciando el bot de Telegram de ResqAI con flujo por pasos...")
+    print("🚀 ResqAI con Threading Lock activo. Listo para múltiples usuarios en simultáneo.")
     bot.infinity_polling(skip_pending=True)
 
 bot_thread = threading.Thread(target=iniciar_bot_en_segundo_plano)
