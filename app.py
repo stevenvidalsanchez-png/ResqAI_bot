@@ -2,8 +2,6 @@ import os
 import threading
 from flask import Flask
 import telebot
-from telebot.handler_backends import State, StatesGroup
-from telebot.storage import StateMemoryStorage
 
 # ------------------------------------------------------------------
 # CONFIGURACIÓN DE FLASK (El truco para engañar a Render)
@@ -15,61 +13,66 @@ def webhook_falso():
     return "ResqAI está vivo y operando con normalidad.", 200
 
 # ------------------------------------------------------------------
-# CONFIGURACIÓN DEL BOT DE TELEGRAM
+# CONFIGURACIÓN DEL BOT DE TELEGRAM (Flujo Directo por Pasos)
 # ------------------------------------------------------------------
-state_storage = StateMemoryStorage()
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
-bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
+bot = telebot.TeleBot(TOKEN)
 
-class ResqueState(StatesGroup):
-    nombre = State()
-    perfil = State()
-    tipo_emergencia = State()
-    detalle_bomberos = State()
-    direccion = State()
+# Diccionario temporal para guardar los datos de la sesión actual
+datos_usuario = {}
 
 # 1. INICIO CON "HOLA"
 @bot.message_handler(func=lambda message: message.text.lower() in ['hola', 'buen día', 'buenos días', 'buenas tardes'])
 def saludo_inicial(message):
-    bot.reply_to(message, "¡Hola! Bienvenido al sistema de asistencia de emergencias ResqAI.\n\nPor favor, dime tu **nombre completo** para iniciar el registro.")
-    bot.set_state(message.from_user.id, ResqueState.nombre, message.chat.id)
+    chat_id = message.chat.id
+    datos_usuario[chat_id] = {} # Inicializar el contenedor de datos para este chat
+    
+    bot.send_message(chat_id, "¡Hola! Bienvenido al sistema de asistencia de emergencias ResqAI.\n\nPor favor, dime tu **nombre completo** para iniciar el registro.")
+    # Forzar a que el siguiente mensaje que envíe el usuario vaya directo a la función 'guardar_nombre'
+    bot.register_next_step_handler(message, guardar_nombre)
 
 # 2. CAPTURA DEL NOMBRE Y PREGUNTA DE PERFIL
-@bot.message_handler(state=ResqueState.nombre)
 def guardar_nombre(message):
+    chat_id = message.chat.id
     nombre_usuario = message.text
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['nombre'] = nombre_usuario
+    
+    # Si el usuario escribe "Hola" de nuevo por error, reiniciar
+    if nombre_usuario.lower() in ['hola', 'buen día', 'buenos días', 'buenas tardes']:
+        saludo_inicial(message)
+        return
+
+    datos_usuario[chat_id]['nombre'] = nombre_usuario
     
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add('Persona del Común', 'Personal de Salud / Rescate')
     
     bot.send_message(
-        message.chat.id, 
+        chat_id, 
         f"Entendido, {nombre_usuario}. Para adecuar las instrucciones de ayuda, por favor indícame tu perfil:",
         reply_markup=markup
     )
-    bot.set_state(message.from_user.id, ResqueState.perfil, message.chat.id)
+    bot.register_next_step_handler(message, guardar_perfil)
 
 # 3. TRIAGE E IDENTIFICACIÓN DEL TIPO DE EMERGENCIA
-@bot.message_handler(state=ResqueState.perfil)
 def guardar_perfil(message):
+    chat_id = message.chat.id
     perfil = message.text
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['perfil'] = perfil
+    
+    if chat_id not in datos_usuario: datos_usuario[chat_id] = {}
+    datos_usuario[chat_id]['perfil'] = perfil
     
     markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add('Urgencia Médica (Salud)', 'Incidente / Bomberos', 'Seguridad (Policía)')
     
-    bot.send_message(message.chat.id, "¿Cuál es el tipo de emergencia principal que estás reportando?", reply_markup=markup)
-    bot.set_state(message.from_user.id, ResqueState.tipo_emergencia, message.chat.id)
+    bot.send_message(chat_id, "¿Cuál es el tipo de emergencia principal que estás reportando?", reply_markup=markup)
+    bot.register_next_step_handler(message, clasificar_emergencia)
 
 # 4. DETALLE SI ES BOMBEROS
-@bot.message_handler(state=ResqueState.tipo_emergencia)
 def clasificar_emergencia(message):
+    chat_id = message.chat.id
     tipo = message.text
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['tipo_emergencia'] = tipo
+    
+    datos_usuario[chat_id]['tipo_emergencia'] = tipo
 
     if tipo == 'Incidente / Bomberos':
         markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
@@ -79,38 +82,41 @@ def clasificar_emergencia(message):
             'Abejas / Avispas', 'Atrapados en Vehículo', 
             'Incendio de Vehículo', 'Fuga de Químicos'
         )
-        bot.send_message(message.chat.id, "Selecciona la situación específica:", reply_markup=markup)
-        bot.set_state(message.from_user.id, ResqueState.detalle_bomberos, message.chat.id)
+        bot.send_message(chat_id, "Selecciona la situación específica:", reply_markup=markup)
+        bot.register_next_step_handler(message, guardar_detalle_bomberos)
     else:
+        datos_usuario[chat_id]['detalle_bomberos'] = 'N/A'
         forzar_solicitud_direccion(message)
 
-@bot.message_handler(state=ResqueState.detalle_bomberos)
 def guardar_detalle_bomberos(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['detalle_bomberos'] = message.text
+    chat_id = message.chat.id
+    datos_usuario[chat_id]['detalle_bomberos'] = message.text
     forzar_solicitud_direccion(message)
 
 # 5. CAPTURA DE DIRECCIÓN
 def forzar_solicitud_direccion(message):
+    chat_id = message.chat.id
     markup = telebot.types.ReplyKeyboardRemove()
     bot.send_message(
-        message.chat.id, 
+        chat_id, 
         "Por favor, escribe la **dirección exacta** del evento (ej: Calle 25 # 98-50) o un punto de referencia claro.",
         reply_markup=markup
     )
-    bot.set_state(message.from_user.id, ResqueState.direccion, message.chat.id)
+    bot.register_next_step_handler(message, finalizar_reporte)
 
 # 6, 7 y 8. LÓGICA DE DESPACHO, ASIGNACIÓN DE VEHÍCULOS Y CENTROS MÉDICOS
-@bot.message_handler(state=ResqueState.direccion)
 def finalizar_reporte(message):
-    direccion = message.text
     chat_id = message.chat.id
+    direccion = message.text
     
-    with bot.retrieve_data(message.from_user.id, chat_id) as data:
-        nombre = data.get('nombre')
-        perfil = data.get('perfil')
-        tipo = data.get('tipo_emergencia')
-        detalle = data.get('detalle_bomberos', 'N/A')
+    if chat_id not in datos_usuario:
+        bot.send_message(chat_id, "Hubo un error de sesión. Por favor escribe 'Hola' de nuevo.")
+        return
+
+    nombre = datos_usuario[chat_id].get('nombre', 'Reportante Anónimo')
+    perfil = datos_usuario[chat_id].get('perfil', 'Persona del Común')
+    tipo = datos_usuario[chat_id].get('tipo_emergencia', 'No especificado')
+    detalle = datos_usuario[chat_id].get('detalle_bomberos', 'N/A')
     
     instrucciones_triage = ""
     vehiculos_despachados = ""
@@ -119,6 +125,7 @@ def finalizar_reporte(message):
     if tipo == 'Urgencia Médica (Salud)':
         if perfil == 'Personal de Salud / Rescate':
             instrucciones_triage = "🚨 **Triage sugerido: Rojo (Prioridad I).** Inicie RCP si no hay pulso, controle sangrados masivos con torniquete."
+            vehiculos_despachados = "ambulancia_despacho_id" # Marcador conceptual de lógica
             vehiculos_despachados = "🚑 **Despachado:** Ambulancia Medicalizada (TAM) + Apoyo de Tránsito."
             hospital_destino = "🏥 **Remisión sugerida:** Hospital Universitario del Valle (HUV) o Clínica Imbanaco."
         else:
@@ -139,6 +146,10 @@ def finalizar_reporte(message):
             hospital_destino = "🏥 **Alerta Preventiva:** Centros de salud de la Red ESE respectiva."
         
         instrucciones_triage = f"🔥 **Protocolo para {detalle}:** Evacúe el área, no inhale humo/gases."
+    else:
+        instrucciones_triage = "🚔 **Seguridad:** Patrulla del cuadrante informada. Alértelos visualmente al llegar."
+        vehiculos_despachados = "🚓 **Despachado:** Unidad Móvil de la Policía Metropolitana de Cali."
+        hospital_destino = "🏥 **Alerta Preventiva:** Red de salud local de cuadrante."
 
     respuesta_final = (
         f"✅ **REPORTE REGISTRADO EXITOSAMENTE**\n"
@@ -155,21 +166,20 @@ def finalizar_reporte(message):
     )
     
     bot.send_message(chat_id, respuesta_final, parse_mode="Markdown")
-    bot.delete_state(message.from_user.id, chat_id)
+    # Limpiar memoria de la sesión
+    datos_usuario.pop(chat_id, None)
 
 # ------------------------------------------------------------------
-# CONTROL DE ARRANQUE SEGURO (El arreglo de los hilos para Gunicorn)
+# CONTROL DE ARRANQUE SEGURO
 # ------------------------------------------------------------------
 def iniciar_bot_en_segundo_plano():
-    print("🚀 Iniciando el bot de Telegram de ResqAI...")
+    print("🚀 Iniciando el bot de Telegram de ResqAI con flujo por pasos...")
     bot.infinity_polling(skip_pending=True)
 
-# Levantar el hilo del bot inmediatamente al cargar el script
 bot_thread = threading.Thread(target=iniciar_bot_en_segundo_plano)
 bot_thread.daemon = True
 bot_thread.start()
 
-# Bloque requerido para ejecución local o fallback directa
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     server.run(host="0.0.0.0", port=port)
