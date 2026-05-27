@@ -158,18 +158,18 @@ def finalizar_reporte(message):
     bot.delete_state(message.from_user.id, chat_id)
 
 # ------------------------------------------------------------------
-# EJECUCIÓN SIMULTÁNEA DE BOT Y FLASK
+# CONTROL DE ARRANQUE SEGURO (El arreglo de los hilos para Gunicorn)
 # ------------------------------------------------------------------
-def run_bot():
-    bot.infinity_polling()
+def iniciar_bot_en_segundo_plano():
+    print("🚀 Iniciando el bot de Telegram de ResqAI...")
+    bot.infinity_polling(skip_pending=True)
 
+# Levantar el hilo del bot inmediatamente al cargar el script
+bot_thread = threading.Thread(target=iniciar_bot_en_segundo_plano)
+bot_thread.daemon = True
+bot_thread.start()
+
+# Bloque requerido para ejecución local o fallback directa
 if __name__ == '__main__':
-    # Hilo para ejecutar el bot de Telegram en segundo plano
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # Arrancar el servidor web en el puerto que Render le asigne
     port = int(os.environ.get("PORT", 10000))
     server.run(host="0.0.0.0", port=port)
-
